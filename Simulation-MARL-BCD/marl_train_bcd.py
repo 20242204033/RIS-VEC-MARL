@@ -85,7 +85,10 @@ gamma = 0.99
 alpha = 0.0001
 beta = 0.001
 update_actor_interval = 2
-noise = 0.2
+noise_start = 0.2
+noise_end = 0.05
+decay_rate = 0.995
+noise = noise_start
 # actor and critic hidden layers
 C_fc1_dims = 1024
 C_fc2_dims = 512
@@ -252,7 +255,11 @@ if IS_TRAIN:
             global_agent.save_models()
             for i in range(n_veh):
                 agents[i].save_models()
-
+         noise = max(noise_end, noise * decay_rate)
+        for a in agents:
+            a.update_noise(noise)
+        global_agent.noise = noise
+        
         # 记录数据，绘制奖励函数曲线
     print('Sum average local power:', np.mean(Sum_Power_local), '   Sum Average offload power:',
           np.mean(Sum_Power_offload))
