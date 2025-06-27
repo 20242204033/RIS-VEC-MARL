@@ -395,4 +395,3 @@ class Environ:
 
         self.DataBuf = np.random.randint(5, self.data_buf_size - 1) / 2.0 * np.ones(self.n_veh)
 
-
