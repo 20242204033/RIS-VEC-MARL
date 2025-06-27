@@ -6,12 +6,12 @@ os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
 import scipy.io
 import Environment
 
-from ddpg_torch import Agent
+from sac_agent import Agent
 from buffer import ReplayBuffer
-from global_critic import Global_Critic
+from  global_sac_critic import Global_SAC_Critic
 import matplotlib.pyplot as plt
 
-# ################## SETTINGS ######################
+# ################## SETTINGS ######################123
 # RIS coordination
 RIS_x, RIS_y, RIS_z = 220, 220, 25
 
@@ -44,7 +44,7 @@ env = Environment.Environ(down_lanes, up_lanes, left_lanes, right_lanes, width, 
 
 env.make_new_game()  # 添加车辆
 
-n_episode = 1000
+n_episode = 300
 n_step_per_episode = 100
 
 def marl_get_state(idx):
@@ -97,16 +97,33 @@ A_fc2_dims = 256
 
 tau = 0.005
 #--------------------------------------------
+# fairness and robustness parameters
+FAIRNESS_LAMBDA = 0.03
+LOW_REWARD_THRESHOLD = -3
+LOW_REWARD_PENALTY = 500
+# penalize reward variance among agents
+VARIANCE_PENALTY = 0.03
+REWARD_NORM = 1000.0  # unused, kept for compatibility
+#--------------------------------------------
+
 agents = []
 for index_agent in range(n_veh):
     print("Initializing agent", index_agent)
-    agent = Agent(alpha, beta, marl_n_input, tau, marl_n_output, gamma, C_fc1_dims, C_fc2_dims, C_fc3_dims,
-                  A_fc1_dims, A_fc2_dims, batch_size, n_veh, index_agent, noise)
-    agents.append(agent)
+    agent_i = Agent(alpha, beta, marl_n_input, tau, marl_n_output, gamma,
+                    C_fc1_dims, C_fc2_dims, C_fc3_dims,
+                    A_fc1_dims, A_fc2_dims, batch_size, n_veh,
+                    index_agent, noise)
+    agents.append(agent_i)
 memory = ReplayBuffer(memory_size, marl_n_input, marl_n_output, n_veh)
 print("Initializing Global critic ...")
-global_agent = Global_Critic(beta, marl_n_input, tau, marl_n_output, gamma, C_fc1_dims, C_fc2_dims, C_fc3_dims,
-                 batch_size, n_veh, update_actor_interval, noise)
+global_agent = Global_SAC_Critic(beta, marl_n_input, tau, marl_n_output, gamma,
+                 C_fc1_dims, C_fc2_dims, C_fc3_dims,
+                 batch_size, n_veh, update_actor_interval,
+                 entropy_scale=1.5)
+
+# running statistics for reward normalization
+running_reward_mean = 0.0
+running_reward_std = 1.0
 
 
 ##Let's go
@@ -192,12 +209,33 @@ if IS_TRAIN:
 
             per_user_reward, global_reward, databuf, data_trans, data_local, over_power, over_data = env.step(action_power)
 
+            # normalize rewards using running mean and variance for stability
+            running_reward_mean = 0.99 * running_reward_mean + 0.01 * np.mean(per_user_reward)
+            running_reward_std = 0.99 * running_reward_std + 0.01 * np.std(per_user_reward)
+            if running_reward_std < 1e-6:
+                running_reward_std = 1.0
+            per_user_reward_norm = (per_user_reward - running_reward_mean) / running_reward_std
+            per_user_reward_norm = np.clip(per_user_reward_norm, -5, 5)
+
+            # gradually increase fairness penalties during training so the
+            # critic can first learn reasonable rewards
+            scaling = min(1.0, i_episode / 400)
+            fairness_lambda = FAIRNESS_LAMBDA * scaling
+            variance_penalty = VARIANCE_PENALTY * scaling
+
+            global_reward += fairness_lambda * np.min(per_user_reward_norm)
+            global_reward -= variance_penalty * np.var(per_user_reward_norm)
+            extreme_indices = np.where(per_user_reward_norm < LOW_REWARD_THRESHOLD)[0]
+            if extreme_indices.size > 0:
+                print("Extreme low reward for users", extreme_indices)
+                global_reward -= LOW_REWARD_PENALTY
+
             Power.append(np.sum(action_power))
             Power_offload.append(np.sum(action_power[0]))
             Power_local.append(np.sum(action_power[1]))
             record_global_reward[i_step] = global_reward
             for i in range(n_veh):
-                record_reward[i, i_step] = per_user_reward[i]
+                record_reward[i, i_step] = per_user_reward_norm[i]
 
             #get new state
             for i in range(n_veh):
@@ -210,7 +248,7 @@ if IS_TRAIN:
 
             # taking the agents actions, states and reward
             memory.store_transition(np.asarray(marl_state_old_all).flatten(), np.asarray(marl_action_all).flatten(),
-                                    global_reward, per_user_reward, np.asarray(marl_state_new_all).flatten(), done)
+                                    global_reward, per_user_reward_norm, np.asarray(marl_state_new_all).flatten(), done)
 
             # agents take random samples and learn
             if memory.mem_cntr >= batch_size:
