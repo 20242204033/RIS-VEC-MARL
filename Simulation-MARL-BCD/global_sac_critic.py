@@ -1,286 +1,444 @@
+
+import torch as T
+import torch.nn.functional as F
+from networks import CriticNetwork
+from torch.amp import GradScaler
 import math
-import os
-os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
-import numpy as np
-import matplotlib.pyplot as plt
-import Environment
-from sac_agent import Agent
-from buffer import ReplayBuffer
-# 【已修改】导入与训练时一致的 Global_SAC_Critic
-from global_sac_critic import Global_SAC_Critic
+
+class Global_SAC_Critic:
+    def __init__(self, beta, input_dims, tau, n_actions, gamma, c1, c2, c3,
+                 batch_size, n_agents, update_actor_interval, alpha_lr=3e-4,
+                 target_entropy=None, entropy_scale=1.0, separate_alpha=False,
+                 chkpt_root=None, use_amp=False, warmup_actor_steps=2000,
+                 update_alpha_interval=4):
+
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.beta = beta
+        self.n_agents = n_agents
+        self.n_actions = n_actions
+        self.n_states = input_dims
+        self.entropy_scale = entropy_scale
+        self.learn_step_counter = 0
+        self.Global_Loss = []
+        # === Running stats for actor/entropy（新增）===
+        self.entropy_ema = None  # 避免 AttributeError
+        self.entropy_ema_beta = 0.98  # 指数滑动平均的衰减因子（可调）
+        self.last_actor_stats = {}  # 便于调试/可视化时缓存最近一次统计
+
+        self.global_action_dim = n_actions * n_agents
+        self.warmup_actor_steps = warmup_actor_steps
+        self.update_actor_iter  = update_actor_interval
+        self.update_alpha_interval = update_alpha_interval
+        self.use_amp = use_amp
+        self.scaler  = GradScaler(enabled=self.use_amp)
 
 
-# ################## SETTINGS ######################
-# RIS coordination
-RIS_x, RIS_y, RIS_z = 220, 220, 25
+        # —— 把全局网络的权重都存到这个新目录 ——
+        # —— 把全局网络的权重保存到 run_dir/global（由外部 marl_train_bcd 传入） ——
+        if chkpt_root is None:
+            new_dir_global = 'runs/exp_prob2N/global'  # 兼容旧逻辑
+        else:
+            import os
+            new_dir_global = os.path.join(chkpt_root, 'global')
+            os.makedirs(new_dir_global, exist_ok=True)
 
-# BS coordination
-BS_x, BS_y, BS_z = 0, 0, 25
+        self.global_critic1 = CriticNetwork(beta, input_dims, c1, c2, c3, n_agents,
+                                            action_dim=self.global_action_dim, name='global_critic1',
+                                            agent_label='global',
+                                            chkpt_dir=new_dir_global)
+        self.global_critic2 = CriticNetwork(beta, input_dims, c1, c2, c3, n_agents,
+                                            action_dim=self.global_action_dim, name='global_critic2',
+                                            agent_label='global',
+                                            chkpt_dir=new_dir_global)
+        self.global_target_critic1 = CriticNetwork(beta, input_dims, c1, c2, c3, n_agents,
+                                                   action_dim=self.global_action_dim, name='global_target_critic1',
+                                                   agent_label='global',
+                                                   chkpt_dir=new_dir_global)
+        self.global_target_critic2 = CriticNetwork(beta, input_dims, c1, c2, c3, n_agents,
+                                                   action_dim=self.global_action_dim, name='global_target_critic2',
+                                                   agent_label='global',
+                                                   chkpt_dir=new_dir_global)
 
-up_lanes = [i/2.0 for i in [400+3.5/2, 400+3.5+3.5/2, 800+3.5/2, 800+3.5+3.5/2]]
-down_lanes = [i/2.0 for i in [400-3.5-3.5/2, 400-3.5/2, 800-3.5-3.5/2, 800-3.5/2]]
-left_lanes = [i/2.0 for i in [400+3.5/2, 400+3.5+3.5/2, 800+3.5/2, 800+3.5+3.5/2]]
-right_lanes = [i/2.0 for i in [400-3.5-3.5/2, 400-3.5/2, 800-3.5-3.5/2, 800-3.5/2]]
+        self.update_global_network_parameters(tau=1)
 
-print('------------- lanes are -------------')
-print('up_lanes :', up_lanes)
-print('down_lanes :', down_lanes)
-print('left_lanes :', left_lanes)
-print('right_lanes :', right_lanes)
-print('------------------------------------')
+        self.separate_alpha = bool(separate_alpha)
 
-width = 800/2
-height = 800/2
+        if not self.separate_alpha:
+            # 旧：单α
+            self.log_alpha = T.zeros(1, requires_grad=True, device=self.global_critic1.device)
+            self.alpha_optimizer = T.optim.Adam([self.log_alpha], lr=alpha_lr)
+        else:
+            # 新：两套α（连续/离散）
+            self.log_alpha_cont = T.zeros(1, requires_grad=True, device=self.global_critic1.device)
+            self.log_alpha_disc = T.zeros(1, requires_grad=True, device=self.global_critic1.device)
+            self.alpha_opt_cont = T.optim.Adam([self.log_alpha_cont], lr=alpha_lr)
+            self.alpha_opt_disc = T.optim.Adam([self.log_alpha_disc], lr=alpha_lr)
 
-# 【已修改】测试时应设为0，因为我们不进行训练和存储
-IS_TRAIN = 0
+        if target_entropy is None:
+            # 按你现有尺度来：每个agent有 n_cont=2 个连续维度；离散K=N
+            n_cont = 2
+            K = max(2, self.n_agents)
+            target_ent_cont = -0.5 * (self.n_agents * n_cont)  # H_c = -1.0 · dim(a_c)
+            target_ent_disc = -0.5 * (self.n_agents * math.log(K))  # H_d = -0.7 · log K
 
-n_veh = 8
-M = 36
-control_bit = 3
-
-###----------------环境设置------------###
-env = Environment.Environ(down_lanes, up_lanes, left_lanes, right_lanes, width, height, n_veh, M, control_bit)
-
-env.make_new_game()  # 添加车辆
-
-n_episode_test = 10
-n_step_per_episode = 100
-
-# 【新增】将NOMA协商函数复制到此，以供调用
-def pairing_negotiation(intent_actions, n_veh, channel_gains, ccs_threshold=0.1):
-    partners = [-1] * n_veh
-    for i in range(n_veh):
-        intent_j = intent_actions[i]
-        if intent_j != i:
-            if intent_actions[intent_j] == i:
-                gain_i = channel_gains[i]
-                gain_j = channel_gains[intent_j]
-                if abs(gain_i - gain_j) > ccs_threshold:
-                    partners[i] = intent_j
-                    partners[intent_j] = i
-    final_groups = []
-    paired_users = set()
-    for i in range(n_veh):
-        if i not in paired_users:
-            partner_i = partners[i]
-            if partner_i != -1:
-                final_groups.append(sorted([i, partner_i]))
-                paired_users.add(i)
-                paired_users.add(partner_i)
+            if not self.separate_alpha:
+                self.target_entropy = target_ent_cont + target_ent_disc
             else:
-                final_groups.append([i])
-                paired_users.add(i)
-    return final_groups
+                # 分离目标熵
+                self.target_entropy_cont = target_ent_cont
+                self.target_entropy_disc = target_ent_disc
+        else:
+            if not self.separate_alpha:
+                self.target_entropy = target_entropy
+            else:
+                # 如果外部传了标量，你也可以按比例切；这里简单按原默认切法
+                self.target_entropy_cont = target_entropy * 0.5
+                self.target_entropy_disc = target_entropy * 0.5
 
-def marl_get_state(idx):
-    """ Get state from the environment """
-    list = []
+    @property
+    def alpha(self):
+        # 兼容旧调用：需要一个标量时，返回“合并后”的等效α（用于老路径）
+        if not self.separate_alpha:
+            return self.log_alpha.exp()
+        else:
+            # 用作回退或日志显示：简单相加（也可取加权平均，这里与local的用法一致）
+            return self.log_alpha_cont.exp() + self.log_alpha_disc.exp()
 
-    Data_Buf = env.DataBuf[idx] / 10
+    @property
+    def alpha_cont(self):
+        return self.log_alpha_cont.exp() if self.separate_alpha else self.log_alpha.exp()
 
-    data_t = env.data_t[idx] / 10
+    @property
+    def alpha_disc(self):
+        return self.log_alpha_disc.exp() if self.separate_alpha else self.log_alpha.exp()
 
-    data_p = env.data_p[idx] / 10
+    def centralized_actor_update(self, agents, states_batch, learn_step_counter, masks_batch=None):
+        """
+        【新增】集中式 Actor 更新（中心化一次反传）。
+        """
+        from torch.amp import autocast
 
-    over_data = env.over_data[idx] / 10
+        if learn_step_counter < self.warmup_actor_steps:
+            return None
 
-    rate = env.vehicle_rate[idx] / 20
+        device = self.global_critic1.device
+        obs_dim = self.n_states
 
-    list.append(Data_Buf)
-    list.append(data_t)
-    list.append(data_p)
-    list.append(over_data)
-    list.append(rate)
+        obs_list = [states_batch[:, i*obs_dim:(i+1)*obs_dim].to(device)
+                    for i in range(self.n_agents)]
 
-    return list
+        joint_actions = []
+        device_type = self.global_critic1.device.type
+        with autocast(device_type=device_type, enabled=self.use_amp):
+            logp_power_list = []
+            logp_int_list = []
+            # === [NEW] Actor 联合采样：支持 mask，与 Critic 目标一致 ===
+            for i, ag in enumerate(agents):
+                obs_i = obs_list[i]
 
-marl_n_input = len(marl_get_state(0))
-# 【已修改】定义与SAC Agent匹配的动作维度
-marl_n_continuous_actions = 2
-marl_n_discrete_actions = 1
-marl_n_output = marl_n_continuous_actions + marl_n_discrete_actions
+                mask_i = None
+                if masks_batch is not None:
+                    if masks_batch.dim() == 3:
+                        mask_i = masks_batch[:, i, :]  # [B, n_agents]
+                    elif masks_batch.dim() == 2:
+                        mask_i = masks_batch  # [B, n_agents]
+                    else:
+                        raise RuntimeError("masks_batch 的形状不合法，应为 [B,N] 或 [B,N,N]")
 
-##---Initializations networks parameters---##
-batch_size = 64
-memory_size = 1000000
-gamma = 0.99
-alpha = 0.0001
-beta = 0.001
-update_actor_interval = 2
-noise = 0.2
-C_fc1_dims = 1024
-C_fc2_dims = 512
-C_fc3_dims = 256
-A_fc1_dims = 512
-A_fc2_dims = 256
-tau = 0.005
+                out = ag.policy.sample_normal(obs_i, mask=mask_i)
+                if isinstance(out, (tuple, list)) and len(out) == 5:
+                    a_pwr, a_probs, logp_power, logp_int, logp_total = out
+                elif isinstance(out, (tuple, list)) and len(out) == 3:
+                    a_pwr, a_probs, logp_total = out
+                    if self.separate_alpha:
+                        raise RuntimeError(
+                            "policy.sample_normal 只返回3个值；当 separate_alpha=True 需要同时返回 logp_power 与 logp_int"
+                        )
+                    logp_power = logp_total
+                    logp_int = T.zeros_like(logp_total)  # 占位
+                else:
+                    raise RuntimeError("policy.sample_normal 返回值数量不符合预期(应为3或5)")
 
-# 【已修改】初始化与训练时一致的SAC智能体
-agents = []
-for index_agent in range(n_veh):
-    print("Initializing agent", index_agent)
-    agent = Agent(alpha, beta, marl_n_input, tau,
-                  n_continuous_actions=marl_n_continuous_actions,
-                  n_discrete_actions=marl_n_discrete_actions,
-                  gamma=gamma,
-                  c1=C_fc1_dims, c2=C_fc2_dims, c3=C_fc3_dims,
-                  a1=A_fc1_dims, a2=A_fc2_dims,
-                  batch_size=batch_size, n_agents=n_veh,
-                  agent_name=index_agent, noise=noise)
-    agents.append(agent)
+                joint_actions.append(T.cat([a_probs, a_pwr], dim=-1))
+                logp_power_list.append(logp_power)  # [B,1]
+                logp_int_list.append(logp_int)  # [B,1]
 
-# 【已修改】初始化与训练时一致的Global_SAC_Critic
-print("Initializing Global SAC critic for testing...")
-global_agent = Global_SAC_Critic(beta, marl_n_input, tau, marl_n_output, gamma, C_fc1_dims, C_fc2_dims, C_fc3_dims,
-                 batch_size, n_veh, update_actor_interval)
+            actions_pi = T.cat(joint_actions, dim=-1).to(device)
+            logp_power_mat = T.cat(logp_power_list, dim=-1)  # [B, N]
+            logp_int_mat = T.cat(logp_int_list, dim=-1)  # [B, N]
+            sum_logp_power = logp_power_mat.sum(dim=-1, keepdim=True)
+            sum_logp_int = logp_int_mat.sum(dim=-1, keepdim=True)
 
-# 【已修改】测试循环，以兼容SAC智能体并包含联合优化逻辑
-# 定义RIS优化频率
-K_STEPS_FOR_RIS_OPTIMIZATION = 100 # 与训练时保持一致
+            q1_pi = self.global_critic1.forward(states_batch.to(device), actions_pi)
+            q2_pi = self.global_critic2.forward(states_batch.to(device), actions_pi)
+            q_min = T.min(q1_pi, q2_pi)
 
-# 加载您通过 marl_train_bcd.py 训练好的SAC模型
-print("Loading SAC models for testing...")
-global_agent.load_models()
-for i in range(n_veh):
-    agents[i].load_models()
+            # === 修正：使用连续+离散两部分 logπ 的和 ===
+            sum_logp_total = sum_logp_power + sum_logp_int
+            batch_entropy = -sum_logp_total.detach()
+            cur_ent = float(batch_entropy.mean().item())
 
-record_reward_ = np.zeros([n_veh, n_episode_test])
-record_global_reward_average = []
-Sum_DataBuf_length = []
-Sum_Power = []
-Sum_Power_local = []
-Sum_Power_offload = []
-Vehicle_positions_x0 = []
-Vehicle_positions_y0 = []
-Vehicle_positions_x1 = []
-Vehicle_positions_y1 = []
-Vehicle_positions_x2 = []
-Vehicle_positions_y2 = []
-Vehicle_positions_x3 = []
-Vehicle_positions_y3 = []
-Vehicle_positions_x4 = []
-Vehicle_positions_y4 = []
-Vehicle_positions_x5 = []
-Vehicle_positions_y5 = []
-Vehicle_positions_x6 = []
-Vehicle_positions_y6 = []
-Vehicle_positions_x7 = []
-Vehicle_positions_y7 = []
+            if self.entropy_ema is None:
+                self.entropy_ema = cur_ent
+            else:
+                beta = float(self.entropy_ema_beta)
+                self.entropy_ema = beta * self.entropy_ema + (1.0 - beta) * cur_ent
+            if (learn_step_counter % self.update_alpha_interval) == 0:
+                if not self.separate_alpha:
+                    # 旧：单α路径（沿用 sum of total logp：= sum_logp_power + sum_logp_int）
+                    sum_logp_total = sum_logp_power + sum_logp_int
+                    alpha_loss = -(self.log_alpha * (-sum_logp_total.detach() - self.target_entropy)).mean()
+                    self.alpha_optimizer.zero_grad(set_to_none=True)
+                    if self.use_amp:
+                        self.scaler.scale(alpha_loss).backward()
+                        self.scaler.step(self.alpha_optimizer)
+                        self.scaler.update()
+                    else:
+                        alpha_loss.backward()
+                        self.alpha_optimizer.step()
+                else:
+                    # 新：分离α路径——各自目标熵与各自logp
+                    alpha_loss_cont = -(
+                                self.log_alpha_cont * (-sum_logp_power.detach() - self.target_entropy_cont)).mean()
+                    alpha_loss_disc = -(
+                                self.log_alpha_disc * (-sum_logp_int.detach() - self.target_entropy_disc)).mean()
 
-for i_episode in range(n_episode_test):
-    done = 0
-    print("-------------------------------- Test Episode:", i_episode, "-------------------------------------------")
-    record_reward = np.zeros([n_veh, n_step_per_episode], dtype=np.float16)
-    record_global_reward = np.zeros(n_step_per_episode)
-    DataBuf_length = []
-    Power = []
-    Power_local = []
-    Power_offload = []
+                    self.alpha_opt_cont.zero_grad(set_to_none=True)
+                    self.alpha_opt_disc.zero_grad(set_to_none=True)
+                    if self.use_amp:
+                        self.scaler.scale(alpha_loss_cont + alpha_loss_disc).backward()
+                        self.scaler.step(self.alpha_opt_cont)
+                        self.scaler.step(self.alpha_opt_disc)
+                        self.scaler.update()
+                    else:
+                        (alpha_loss_cont + alpha_loss_disc).backward()
+                        self.alpha_opt_cont.step()
+                        self.alpha_opt_disc.step()
 
-    env.renew_positions()
-    env.compute_parms()
-    Vehicle_positions_x0.append(env.vehicles[0].position[0])
-    Vehicle_positions_y0.append(env.vehicles[0].position[1])
-    Vehicle_positions_x1.append(env.vehicles[1].position[0])
-    Vehicle_positions_y1.append(env.vehicles[1].position[1])
-    Vehicle_positions_x2.append(env.vehicles[2].position[0])
-    Vehicle_positions_y2.append(env.vehicles[2].position[1])
-    Vehicle_positions_x3.append(env.vehicles[3].position[0])
-    Vehicle_positions_y3.append(env.vehicles[3].position[1])
-    Vehicle_positions_x4.append(env.vehicles[4].position[0])
-    Vehicle_positions_y4.append(env.vehicles[4].position[1])
-    Vehicle_positions_x5.append(env.vehicles[5].position[0])
-    Vehicle_positions_y5.append(env.vehicles[5].position[1])
-    Vehicle_positions_x6.append(env.vehicles[6].position[0])
-    Vehicle_positions_y6.append(env.vehicles[6].position[1])
-    Vehicle_positions_x7.append(env.vehicles[7].position[0])
-    Vehicle_positions_y7.append(env.vehicles[7].position[1])
+            # 构造 actor 损失
+            if not self.separate_alpha:
+                sum_logp_total = sum_logp_power + sum_logp_int
+                alpha_pi = (self.log_alpha.exp() * self.entropy_scale).detach()
+                actor_global_loss = (alpha_pi * sum_logp_total - q_min).mean()
+            else:
+                alpha_c = (self.log_alpha_cont.exp() * self.entropy_scale).detach()
+                alpha_d = (self.log_alpha_disc.exp() * self.entropy_scale).detach()
+                # 分别加权两部分熵
+                actor_global_loss = (alpha_c * sum_logp_power + alpha_d * sum_logp_int - q_min).mean()
 
-    marl_state_old_all = [marl_get_state(i) for i in range(n_veh)]
+        uniq = {id(ag.policy): ag.policy for ag in agents}
+        uniq_pols = list(uniq.values())
 
-    for i_step in range(n_step_per_episode):
-        
-        # --- 1. 按频率优化RIS并更新信道状态 ---
-        if i_step % K_STEPS_FOR_RIS_OPTIMIZATION == 0:
-            env.optimize_phase_shift()
-            env.update_channel_gains()
+        for pol in uniq_pols:
+            pol.optimizer.zero_grad(set_to_none=True)
 
-        # --- 2. 智能体观察最新的环境状态 ---
-        current_channel_gains = env.get_channel_gains()
-        marl_state_old_all = [marl_get_state(i) for i in range(n_veh)]
+        if self.use_amp:
+            self.scaler.scale(actor_global_loss).backward()
+            for pol in uniq_pols:
+                self.scaler.unscale_(pol.optimizer)
+                T.nn.utils.clip_grad_norm_(pol.parameters(), 1.0)
+            for pol in uniq_pols:
+                self.scaler.step(pol.optimizer)
+            self.scaler.update()
+        else:
+            actor_global_loss.backward()
+            for pol in uniq_pols:
+                T.nn.utils.clip_grad_norm_(pol.parameters(), 1.0)
+                pol.optimizer.step()
 
-        # --- 3. 智能体决策并进行NOMA协商 ---
-        marl_power_actions = []
-        marl_intent_actions = []
-        for i in range(n_veh):
-            # SAC Agent的choose_action返回两个值
-            power_action, intent_action = agents[i].choose_action(marl_state_old_all[i])
-            marl_power_actions.append(power_action)
-            marl_intent_actions.append(intent_action)
-        
-        # 在测试时同样需要NOMA协商
-        noma_groups = pairing_negotiation(marl_intent_actions, n_veh, current_channel_gains)
+        ret = {
+            "actor_global_loss": float(actor_global_loss.detach().cpu().item()),
+            "entropy_ema": float(self.entropy_ema),
+            "q_min_mean": float(q_min.detach().mean().cpu().item()),
+        }
+        if not self.separate_alpha:
+            ret["alpha"] = float(self.alpha.detach().cpu().item())
+        else:
+            ret["alpha_cont"] = float(self.alpha_cont.detach().cpu().item())
+            ret["alpha_disc"] = float(self.alpha_disc.detach().cpu().item())
+        return ret
 
-        # --- 4. 准备功率动作并与环境交互 ---
-        action_for_env = np.zeros([2, n_veh], dtype=float)
-        for i in range(n_veh):
-            clipped_power = np.clip(marl_power_actions[i], -0.999, 0.999)
-            action_for_env[0, i] = (clipped_power[0] + 1) / 2
-            action_for_env[1, i] = (clipped_power[1] + 1) / 2
+    # 新签名：增加 masks 形参；并把它规范为 [B, N, N] 或 None
+    def global_learn(self, agents_nets, state, action, reward_g, reward_l, state_, terminal, masks=None):
+        states = T.tensor(state, dtype=T.float).to(self.global_critic1.device)
+        states_ = T.tensor(state_, dtype=T.float).to(self.global_critic1.device)
+        actions = T.tensor(action, dtype=T.float).to(self.global_critic1.device)
+        rewards_g = T.tensor(reward_g, dtype=T.float).to(self.global_critic1.device)
+        rewards_l = T.tensor(reward_l, dtype=T.float).to(self.global_critic1.device)
+        done = T.tensor(terminal, dtype=T.bool, device=self.global_critic1.device)
 
-        per_user_reward, global_reward, databuf, data_trans, data_local, over_power, over_data = env.step(action_for_env, noma_groups)
-        
-        Power.append(np.sum(action_for_env))
-        Power_offload.append(np.sum(action_for_env[0]))
-        Power_local.append(np.sum(action_for_env[1]))
-        DataBuf_length.append(np.sum(databuf))
 
-        record_global_reward[i_step] = global_reward
-        for i in range(n_veh):
-            record_reward[i, i_step] = per_user_reward[i]
+        # 统一 batch 掩码的形状
+        masks_batch = None
+        if masks is not None:
+            m = T.tensor(masks, dtype=T.float32, device=self.global_critic1.device)
+            if m.dim() == 2 and m.size(1) == self.n_agents * self.n_agents:
+                masks_batch = m.view(-1, self.n_agents, self.n_agents)  # [B,N,N]
+            elif m.dim() == 3 and m.size(1) == self.n_agents and m.size(2) == self.n_agents:
+                masks_batch = m  # [B,N,N]
+            elif m.dim() == 2 and m.size(1) == self.n_agents:
+                # 也兼容传进来就是 [B,N] 的“行掩码”，后面会按行取用
+                masks_batch = m  # [B,N]
+            else:
+                raise RuntimeError("masks 的形状应为 [B,N,N] 或 [B,N] 或 [B,N*N]")
 
-        marl_state_old_all = [marl_get_state(i) for i in range(n_veh)]
+        # ---- 1) 更新全局 Critic ----
+        self.global_target_critic1.eval()
+        self.global_target_critic2.eval()
 
-    for i in range(n_veh):
-        record_reward_[i, i_episode] = np.mean(record_reward[i])
-        print('user', i, record_reward_[i, i_episode], end='      ')
-    
-    average_global_reward = np.mean(record_global_reward)
-    record_global_reward_average.append(average_global_reward)
+        B = states_.size(0)  # 实际 batch 大小
+        next_actions = T.zeros(B, self.n_actions * self.n_agents, device=self.global_critic1.device)
+        next_logp_power_sum = T.zeros(B, 1, device=self.global_critic1.device)
+        next_logp_int_sum = T.zeros(B, 1, device=self.global_critic1.device)
+        # === [NEW] 目标Q动作采样：支持 mask，与 Actor 一致 ===
+        for j, agent in enumerate(agents_nets):
+            obs_j = states_[:, j * self.n_states:(j + 1) * self.n_states]
 
-    Power_episode = np.mean(Power)
-    Power_local_episode = np.mean(Power_local)
-    Power_offload_episode = np.mean(Power_offload)
-    DataBuf_length_episode = np.mean(DataBuf_length)
+            # 从 batch 级 mask 里取出第 j 个 agent 的可选配对（形状 [B, n_agents] 或 [n_agents]）
+            mask_j = None
+            if 'masks_batch' in locals() and masks_batch is not None:
+                # 允许两种形状：
+                #   1) [B, n_agents, n_agents]：取第 j 行 => [B, n_agents]
+                #   2) [B, n_agents]：直接使用
+                if masks_batch.dim() == 3:
+                    mask_j = masks_batch[:, j, :]  # [B, n_agents]
+                elif masks_batch.dim() == 2:
+                    mask_j = masks_batch  # [B, n_agents]
+                else:
+                    raise RuntimeError("masks_batch 的形状不合法，应为 [B,N] 或 [B,N,N]")
 
-    Sum_Power.append(Power_episode)
-    Sum_Power_local.append(Power_local_episode)
-    Sum_Power_offload.append(Power_offload_episode)
-    Sum_DataBuf_length.append(DataBuf_length_episode)
-    print('Global reward:', average_global_reward)
-    print('Average Total Power:', Power_episode)
-    print('Average local power:', Power_local_episode, '   Average offload power:',
-          Power_offload_episode)
+            out = agent.policy.sample_normal(obs_j, mask=mask_j)
+            if isinstance(out, (tuple, list)) and len(out) == 5:
+                power_a, intent_probs, logp_power, logp_int, logp_total = out
+            elif isinstance(out, (tuple, list)) and len(out) == 3:
+                power_a, intent_probs, logp_total = out
+                if self.separate_alpha:
+                    raise RuntimeError(
+                        "policy.sample_normal 只返回3个值；当 separate_alpha=True 需要 logp_power 与 logp_int"
+                    )
+                logp_power = logp_total
+                logp_int = T.zeros_like(logp_total)
+            else:
+                raise RuntimeError("policy.sample_normal 返回值数量不符合预期(应为3或5)")
 
-print('------------SAC-NOMA-RIS Test Done-------------')
-for i in range(n_veh):
-    print('Average User Reward:', i, ':', np.mean(record_reward_[i, :]))
-print('Average Global Reward:', np.mean(record_global_reward_average),
-      '   Sum Average Power:', np.mean(Sum_Power), '   Sum Average DataBuf:', np.mean(Sum_DataBuf_length))
-print('Sum average local power:', np.mean(Sum_Power_local), '   Sum Average offload power:', np.mean(Sum_Power_offload))
+            start = j * self.n_actions
+            # TD 目标：把离散意图概率压成 one-hot(argmax)
+            idx_j = T.argmax(intent_probs, dim=-1)  # [B]
+            onehot_j = F.one_hot(idx_j, num_classes=self.n_agents).float()  # [B, N]
 
-plt.figure(1)
-# fig = plt.figure(figsize=(width/100, height/100))
-plt.plot(BS_x, BS_y, 'o', markersize=5, color='black', label='BS')
-plt.plot(RIS_x, RIS_y, 'o', markersize=5, color='brown', label='RIS')
-plt.plot(Vehicle_positions_x0, Vehicle_positions_y0)
-plt.plot(Vehicle_positions_x1, Vehicle_positions_y1)
-plt.plot(Vehicle_positions_x2, Vehicle_positions_y2)
-plt.plot(Vehicle_positions_x3, Vehicle_positions_y3)
-plt.plot(Vehicle_positions_x4, Vehicle_positions_y4)
-plt.plot(Vehicle_positions_x5, Vehicle_positions_y5)
-plt.plot(Vehicle_positions_x6, Vehicle_positions_y6)
-plt.plot(Vehicle_positions_x7, Vehicle_positions_y7)
+            # 写回全局 next_actions 的该 agent 段
+            next_actions[:, start:start + self.n_agents] = onehot_j
+            next_actions[:, start + self.n_agents:start + self.n_actions] = power_a
 
-plt.show()
+            next_logp_power_sum = next_logp_power_sum + logp_power
+            next_logp_int_sum = next_logp_int_sum + logp_int
+
+        with T.no_grad():
+            q1_next = self.global_target_critic1.forward(states_, next_actions)
+            q2_next = self.global_target_critic2.forward(states_, next_actions)
+            if not self.separate_alpha:
+                # 单α：复用原来总logp = 两者相加
+                next_logp_total = next_logp_power_sum + next_logp_int_sum
+                min_q_next = T.min(q1_next, q2_next) - self.alpha * self.entropy_scale * next_logp_total
+            else:
+                # 分离α：分别加权
+                alpha_c = self.alpha_cont * self.entropy_scale
+                alpha_d = self.alpha_disc * self.entropy_scale
+                min_q_next = T.min(q1_next, q2_next) - (alpha_c * next_logp_power_sum + alpha_d * next_logp_int_sum)
+
+        target = rewards_g + self.gamma * min_q_next.view(-1)
+        target[done] = rewards_g[done]
+        target = target.view(B, 1)
+
+        self.global_critic1.train()
+        self.global_critic2.train()
+        q1 = self.global_critic1.forward(states, actions)
+        q2 = self.global_critic2.forward(states, actions)
+        critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+
+        self.global_critic1.optimizer.zero_grad(set_to_none=True)
+        self.global_critic2.optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        T.nn.utils.clip_grad_norm_(self.global_critic1.parameters(), 1.0)
+        T.nn.utils.clip_grad_norm_(self.global_critic2.parameters(), 1.0)
+        self.global_critic1.optimizer.step()
+        self.global_critic2.optimizer.step()
+        self.Global_Loss.append(critic_loss.detach().cpu().numpy())
+
+        self.update_global_network_parameters()
+        self.learn_step_counter += 1
+
+        # ---- 2) 间歇触发：中心化 Actor 更新 + 本地 Critic 更新 ----
+        if self.learn_step_counter % self.update_actor_iter == 0:
+            self.last_actor_stats = self.centralized_actor_update(
+                agents_nets, states, self.learn_step_counter, masks_batch
+            )
+            for i, agent in enumerate(agents_nets):
+                action_slice = actions[:, i*self.n_actions:(i+1)*self.n_actions]
+                state_slice  = states[:,  i*self.n_states:(i+1)*self.n_states]
+                next_slice   = states_[:, i*self.n_states:(i+1)*self.n_states]
+                reward_slice = rewards_l[:, i]
+                if not self.separate_alpha:
+                    agent.local_learn(state_slice, action_slice, reward_slice, next_slice,
+                                      done,
+                                      self.alpha.detach() * self.entropy_scale,  # power
+                                      self.alpha.detach() * self.entropy_scale)  # intent
+                else:
+                    agent.local_learn(state_slice, action_slice, reward_slice, next_slice,
+                                      done,
+                                      self.alpha_cont.detach() * self.entropy_scale,
+                                      self.alpha_disc.detach() * self.entropy_scale)
+
+    def update_global_network_parameters(self, tau=None):
+        if tau is None:
+            tau = self.tau
+        for target_param, param in zip(self.global_target_critic1.parameters(), self.global_critic1.parameters()):
+            target_param.data.copy_(tau * param.data + (1-tau) * target_param.data)
+        for target_param, param in zip(self.global_target_critic2.parameters(), self.global_critic2.parameters()):
+            target_param.data.copy_(tau * param.data + (1-tau) * target_param.data)
+
+    def save_models(self):
+        self.global_critic1.save_checkpoint()
+        self.global_critic2.save_checkpoint()
+        self.global_target_critic1.save_checkpoint()
+        self.global_target_critic2.save_checkpoint()
+        # === save alpha parameters (stage-3) ===
+        try:
+            alpha_dict = {}
+            if not self.separate_alpha:
+                alpha_dict["log_alpha"] = self.log_alpha.detach().cpu()
+            else:
+                alpha_dict["log_alpha_cont"] = self.log_alpha_cont.detach().cpu()
+                alpha_dict["log_alpha_disc"] = self.log_alpha_disc.detach().cpu()
+            import os, torch as T
+            alpha_path = os.path.join(self.global_critic1.checkpoint_dir, "alpha.pt")
+            T.save(alpha_dict, alpha_path)
+        except Exception as _e:
+            print("[WARN] save alpha failed:", _e)
+
+
+    def load_models(self):
+        self.global_critic1.load_checkpoint()
+        self.global_critic2.load_checkpoint()
+        self.global_target_critic1.load_checkpoint()
+        self.global_target_critic2.load_checkpoint()
+        # === load alpha parameters (stage-3) ===
+        try:
+            import os, torch as T
+            alpha_path = os.path.join(self.global_critic1.checkpoint_dir, "alpha.pt")
+            if os.path.exists(alpha_path):
+                alpha_dict = T.load(alpha_path, map_location=self.global_critic1.device)
+                if not self.separate_alpha and "log_alpha" in alpha_dict:
+                    with T.no_grad():
+                        self.log_alpha.copy_(alpha_dict["log_alpha"].to(self.global_critic1.device))
+                else:
+                    if "log_alpha_cont" in alpha_dict:
+                        with T.no_grad():
+                            self.log_alpha_cont.copy_(alpha_dict["log_alpha_cont"].to(self.global_critic1.device))
+                    if "log_alpha_disc" in alpha_dict:
+                        with T.no_grad():
+                            self.log_alpha_disc.copy_(alpha_dict["log_alpha_disc"].to(self.global_critic1.device))
+        except Exception as _e:
+            print("[WARN] load alpha failed:", _e)
