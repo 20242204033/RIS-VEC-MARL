@@ -1,0 +1,161 @@
+
+# ========= 训练 =========
+seed: 42                  # 你可以后面再换 13/123 做稳健性
+total_episodes: 300
+batch_size: 128
+replay_size: 1000000
+gamma: 0.99
+tau_soft_update: 0.005
+grad_clip_norm: 10.0
+mutual_mask_after: 100   # 训练前 300 回合，互选不叠加掩码；300 之后再叠加
+
+
+# 学习率
+lr_actor: 2.0e-4          # Actor 稍小
+lr_critic: 3.0e-4         # Critic 稍大
+lr_alpha_cont: 3.0e-4     # 连续温度 α
+lr_alpha_disc: 3.0e-4     # 离散温度 α
+
+# ========== Gumbel-Softmax（离散意图）==========
+gumbel_tau_start: 1.0
+gumbel_tau_end: 0.3     # 不要太低，0.3 更稳
+gumbel_tau_warmup_episodes: 0.8  # 用“训练进度 70% 完成退火”的语义；若你代码是整数，请填总 ep 的 0.7 倍
+gumbel_hard_train: true
+gumbel_hard_eval: true
+
+# ========== SAC 频率控制 ==========
+update_every: 1
+update_after: 5000
+train_iters_per_step: 1
+update_actor_interval: 1           # 从 2 -> 1，更频繁更新 Actor
+warmup_actor_steps: 1000           # 从 2000 -> 1000，Actor 更早介入
+
+# ========== 熵目标 ==========
+target_entropy_cont_scale: 0.8     # -(action_dim) * 该系数
+target_entropy_disc_scale: 0.35    # -log(K) * 该系数
+entropy_scale: 0.5
+
+# ========== 掩码（Stage-4/6）==========
+mask_enable: true
+mask_warmup_episodes: 100        # 延长从松到紧
+mask_topk_start: 7
+mask_topk_end: 7                  # 原来 2 太紧
+mask_tau_q_start: 0.15
+mask_tau_q_end: 0.18               # 原来 ~0.55 太严
+mask_qos_soften: true              # 0 位给 -5~-8，而非 -inf
+
+# ========== 互选（Stage-5B）==========
+use_mutual_pairing: true
+mutual_use_mask: true
+mutual_q_quantile: 0.15           # 阈值放宽（原 0.5 偏严）
+pairing_intent_weight_max: 0.6     # 若你代码有“意图-权重”lambda，给个保守上限
+pairing_intent_warmup_episodes: 2000
+min_pair_target: 3
+
+
+# ========== 公平/方差/协同 ==========
+FAIRNESS_LAMBDA: 0.04            # 从 0.03 稍提，但用“阈值型欠公平”公式（见补丁）
+VARIANCE_PENALTY: 0.01             # 从 0.03 -> 0.01，避免主导
+COOP_PAIR_BONUS: 0.02
+
+# ========== 环境/QoS/刷新 ==========
+qos_enable: true
+qos_penalty: 1.5                   # 若你之前 >=3，先降到 1~2 观察稳定性
+env_refresh_every: 5               # 新增：每 5 个 episode 刷新一次位置/信道
+
+# ========== 网络 ==========
+hidden_sizes_actor: [256, 256]
+hidden_sizes_critic: [256, 256]
+activation: "relu"
+layernorm: false
+action_std_init: 0.5
+log_std_min: -5
+log_std_max: 2
+
+
+reward:
+  # —— 掩码课程（Stage-4），直接决定“候选对”多不多 ——
+  mask_enable: true
+  mask_topk_start: 7        # N=8 时早期几乎不裁
+  mask_topk_end: 7         # 末期也别太紧（原来是 max(3, n/3)）
+  mask_tau_q_start: 0.10    # 由 0.20 → 0.10
+  mask_tau_q_end: 0.25      # 由 0.40 → 0.30
+  pairing_threshold_quantile: 0.25   # 从 0.60 放宽到 0.30
+    # —— 权重：采样区间，更看重时延，适度考虑能耗 ——
+  sample: false
+  w_d_fixed: 1.0        # 等权
+  w_e_fixed: 1.0        # 等权
+  norm_beta: 0.9        # EMA 衰减（0.9~0.99 都行；0.9 收敛更快）
+
+
+# ===== NOMA-V3: 打分/稳定性/回退（新增，可在 YAML 调参；缺省有代码默认值）=====
+# —— 打分与稳定性 ——
+score_w_delta_db: 1.0
+score_w_history: 0.3
+stickiness_tau_db: 1.0
+pair_hist_decay: 0.97
+pair_unstick_prob: 0.02
+
+# —— 质量过滤（A/B 后再开；设为 -inf 表示关闭） ——
+abs_gain_min_db: -120
+
+# —— 受限回退策略 ——
+max_backoff_rounds: 3
+relax_q_step: 0.02
+relax_topk_step: 1
+relax_tau_factor_per_round: 0.95
+# --- Soft power penalty (adaptive) ---
+soft_power_beta: 0.9                # EMA 衰减
+soft_power_floor: 6.4               # 阈值安全下限
+soft_power_margin: 0.2              # 基线之上多少才开始罚
+soft_power_coef_linear: 0.0         # 可选线性项
+soft_power_coef_quad: 0.05          # 二次项主力
+soft_power_cap_per_step: 0.3        # 单步惩罚封顶
+use_soft_power_penalty: true
+
+#mwm
+use_mwm_primary: true            # 启用“主 MWM”
+mwm_accept_quantile: 0.10        # 只在高于该分位的边上匹配；想更“多”可降到 0.15 或 0.10
+mwm_backoff_rounds: 3            # 不足目标对数时最多放宽轮数
+mwm_accept_q_step: 0.05          # 每轮放宽：分位数下降的步长
+legacy_pairing_backoff: false    # 关闭旧回退分支（mutual/stable），避免覆盖主结果
+# ======== RVM: capacity & mapping fix (stable) ========
+mec:
+  # 本地 CPU 上限——把“每步可处理的 kbit”直接抬上去（3GHz 起步够用）
+  f_local_max: 3.0e9
+  # 单比特运算开销——从 500 降到 300，进一步放大本地处理能力
+  cycles_per_bit: 300
+  # 可选：如想观察 MEC 排队，可下调到 2e9；保持 1.0e10 则几乎不排队
+
+
+phy:
+  # 带宽从 1 → 5 MHz，显著提高可卸载上限；噪声会按带宽自动重算
+  bandwidth_MHz: 5
+  # 发射功率上限同步抬高（与带宽匹配，避免链路受限）
+  P_max: 2.0
+
+
+env:
+  # 负载强度：把 rate 临时降到 1，先把系统拉回稳态（验证后再调回 2 或 3）
+  rate: 1
+# ======== /RVM patch ========
+
+
+# --- Grouping freeze & safeties ---
+freeze_group_in_episode: true    # 默认 true
+freeze_recalc_every: 0           # 0 表示整回合冻结；或设为 10 表示每 10 步允许重算一次
+freeze_unstick_prob: 0.0         # 小概率解冻；需要探索时可设 0.01
+freeze_reward_drop_ratio: 0.05   # 回合内 env.global 较本回合历史最好值下跌超 5% 时触发一次解冻
+
+
+
+
+
+
+
+
+
+
+
+
+
